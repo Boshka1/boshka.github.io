@@ -1,0 +1,191 @@
+<?php
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/php_api_errors.log'); // Убедитесь, что путь корректен и доступен для записи
+
+session_start();
+header('Content-Type: application/json'); // Устанавливаем заголовок, что ответ будет в формате JSON
+
+require_once 'config/database.php';
+require_once 'utils/validation.php'; // Подключаем ваши функции валидации
+
+$response = ['success' => false, 'message' => ''];
+
+// Обработка только POST-запросов
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    $response['message'] = 'Метод запроса не поддерживается.';
+    echo json_encode($response);
+    exit;
+}
+
+// Получаем JSON-данные из тела запроса
+$input = file_get_contents('php://input');
+$data = json_decode($input, true);
+
+if (json_last_error() !== JSON_ERROR_NONE) {
+    $response['message'] = 'Ошибка при парсинге JSON: ' . json_last_error_msg();
+    error_log("JSON Decode Error: " . json_last_error_msg() . " Input: " . $input);
+    echo json_encode($response);
+    exit;
+}
+
+// Проверяем, авторизован ли пользователь
+$is_authenticated = isset($_SESSION['user_id']);
+$user_id = $_SESSION['user_id'] ?? null;
+
+error_log("API Request: authenticated=" . ($is_authenticated ? 'true' : 'false') . ", user_id=" . ($user_id ?? 'N/A') . ", data=" . print_r($data, true));
+
+// Валидация и обработка данных
+$errors = [];
+
+// Всегда валидируем все поля, которые могут прийти в запросе
+$fullName = trim($data['full_name'] ?? '');
+$phone = trim($data['phone'] ?? '');
+$email = trim($data['email'] ?? '');
+$birthDate = trim($data['dob'] ?? ''); // 'dob' из index.php, 'birth_date' из admin_edit/save_edit
+$gender = $data['gender'] ?? '';
+$languageNames = $data['languages'] ?? []; // Имена языков для регистрации
+$languageIds = []; // ID языков для обновления
+$biography = trim($data['bio'] ?? ''); // 'bio' из index.php, 'biography' из admin_edit/save_edit
+$contractAccepted = isset($data['contract']); // 'contract' из index.php, 'contractAccepted' из admin_edit/save_edit
+
+// Адаптируем имена полей для валидации, если они отличаются
+// Для 'dob' и 'bio' используем их как есть из index.php, так как валидация не привязана к имени поля
+// При обновлении, если пришли id языков, а не имена, нужно их использовать
+if ($is_authenticated && isset($data['languages'][0]) && is_numeric($data['languages'][0])) {
+    $languageIds = $data['languages']; // Если приходят ID языков
+} else {
+    // Если приходят имена языков (для нового пользователя), получаем их ID
+    if (!empty($languageNames)) {
+        foreach ($languageNames as $langName) {
+            $stmt = $conn->prepare("SELECT id FROM programming_languages WHERE name = ?");
+            $stmt->bind_param("s", $langName);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            if ($row = $result->fetch_assoc()) {
+                $languageIds[] = $row['id'];
+            }
+            $stmt->close();
+        }
+    }
+}
+
+
+if ($error = validateFullName($fullName)) { $errors['full_name'] = $error; }
+if ($error = validatePhone($phone)) { $errors['phone'] = $error; }
+if ($error = validateEmail($email)) { $errors['email'] = $error; }
+if ($error = validateBirthDate($birthDate)) { $errors['dob'] = $error; }
+if ($error = validateGender($gender)) { $errors['gender'] = $error; }
+if ($error = validateLanguages($languageIds, $conn)) { $errors['languages'] = $error; }
+if ($error = validateBiography($biography)) { $errors['bio'] = $error; }
+if ($error = validateContract($contractAccepted)) { $errors['contract'] = $error; }
+
+if (!empty($errors)) {
+    $response['message'] = 'Ошибка валидации';
+    $response['errors'] = $errors;
+    error_log("Validation errors: " . print_r($errors, true));
+    echo json_encode($response);
+    exit;
+}
+
+if ($is_authenticated) {
+    // Авторизованный пользователь: обновление данных
+    // Логин и пароль не меняются
+    try {
+        $stmt = $conn->prepare("UPDATE applicants SET full_name = ?, phone = ?, email = ?, birth_date = ?, gender = ?, biography = ?, contract_accepted = ? WHERE id = ?");
+        $contractAcceptedInt = $contractAccepted ? 1 : 0;
+        $stmt->bind_param("ssssssii", $fullName, $phone, $email, $birthDate, $gender, $biography, $contractAcceptedInt, $user_id);
+
+        if (!$stmt->execute()) {
+            throw new Exception("Ошибка при обновлении данных пользователя: " . $stmt->error);
+        }
+        $stmt->close();
+
+        // Обновление языков
+        $conn->query("DELETE FROM applicant_languages WHERE applicant_id = $user_id");
+        if (!empty($languageIds)) {
+            $lang_stmt = $conn->prepare("INSERT INTO applicant_languages (applicant_id, language_id) VALUES (?, ?)");
+            $lang_stmt->bind_param("ii", $user_id, $lang_id);
+            foreach ($languageIds as $lang_id) {
+                if (!$lang_stmt->execute()) {
+                    throw new Exception("Ошибка при вставке языка ($lang_id): " . $lang_stmt->error);
+                }
+            }
+            $lang_stmt->close();
+        }
+
+        $response['success'] = true;
+        $response['message'] = 'Данные успешно обновлены.';
+        error_log("User ID {$user_id} data updated successfully.");
+
+    } catch (Exception $e) {
+        $response['message'] = 'Ошибка при обновлении данных: ' . $e->getMessage();
+        error_log("Update error for user ID {$user_id}: " . $e->getMessage());
+    }
+
+} else {
+    // Неавторизованный пользователь: создание нового пользователя
+    try {
+        // Генерация уникального логина
+        $base_login = 'user_' . bin2hex(random_bytes(4));
+        $login = $base_login;
+        $counter = 1;
+        while (true) {
+            $stmt_check_login = $conn->prepare("SELECT COUNT(*) FROM applicants WHERE login = ?");
+            $stmt_check_login->bind_param("s", $login);
+            $stmt_check_login->execute();
+            $result_check = $stmt_check_login->get_result();
+            if ($result_check->fetch_row()[0] == 0) {
+                $stmt_check_login->close();
+                break;
+            }
+            $login = $base_login . '_' . $counter++;
+            $stmt_check_login->close();
+        }
+
+        // Генерация пароля
+        $password = bin2hex(random_bytes(8));
+        $password_hash = password_hash($password, PASSWORD_DEFAULT);
+
+        // Вставка нового пользователя
+        $stmt = $conn->prepare("INSERT INTO applicants (full_name, phone, email, birth_date, gender, biography, contract_accepted, login, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $contractAcceptedInt = $contractAccepted ? 1 : 0;
+        $stmt->bind_param("ssssssiss", $fullName, $phone, $email, $birthDate, $gender, $biography, $contractAcceptedInt, $login, $password_hash);
+
+        if (!$stmt->execute()) {
+            throw new Exception("Ошибка при создании нового пользователя: " . $stmt->error);
+        }
+        $applicant_id = $stmt->insert_id;
+        $stmt->close();
+
+        // Вставка языков для нового пользователя
+        if (!empty($languageIds)) {
+            $lang_stmt = $conn->prepare("INSERT INTO applicant_languages (applicant_id, language_id) VALUES (?, ?)");
+            $lang_stmt->bind_param("ii", $applicant_id, $lang_id);
+            foreach ($languageIds as $lang_id) {
+                if (!$lang_stmt->execute()) {
+                    throw new Exception("Ошибка при вставке языка ($lang_id) для нового пользователя: " . $lang_stmt->error);
+                }
+            }
+            $lang_stmt->close();
+        }
+
+        $response['success'] = true;
+        $response['message'] = 'Пользователь успешно зарегистрирован!';
+        $response['login'] = $login;
+        $response['password'] = $password;
+        $response['profile_url'] = 'edit_form.php'; // Ссылка на профиль
+        error_log("New user created: Login {$login}");
+
+    } catch (Exception $e) {
+        $response['message'] = 'Ошибка при регистрации: ' . $e->getMessage();
+        error_log("Registration error: " . $e->getMessage());
+    }
+}
+
+$conn->close();
+echo json_encode($response);
+exit;
+?>
